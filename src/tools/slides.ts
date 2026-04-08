@@ -167,6 +167,25 @@ const InsertSlidesImageFromUrlSchema = z.object({
   height: z.number().optional(),
 });
 
+const MoveSlideElementSchema = z.object({
+  presentationId: z.string().min(1, "Presentation ID is required"),
+  objectId: z.string().min(1, "Element object ID is required"),
+  x: z.number().optional(),
+  y: z.number().optional(),
+  width: z.number().optional(),
+  height: z.number().optional(),
+});
+
+const DeleteSlideElementSchema = z.object({
+  presentationId: z.string().min(1, "Presentation ID is required"),
+  objectId: z.string().min(1, "Element object ID is required"),
+});
+
+const GetSlideElementInfoSchema = z.object({
+  presentationId: z.string().min(1, "Presentation ID is required"),
+  slideObjectId: z.string().optional(),
+});
+
 const InsertSlidesLocalImageSchema = z.object({
   presentationId: z.string().min(1, "Presentation ID is required"),
   pageObjectId: z.string().min(1, "Slide/page object ID is required"),
@@ -620,6 +639,46 @@ export const toolDefinitions: ToolDefinition[] = [
         height: { type: "number", description: "Height in EMU (omit to auto-size)" }
       },
       required: ["presentationId", "pageObjectId", "imageUrl"]
+    }
+  },
+  {
+    name: "getSlideElementInfo",
+    description: "Get position, size, and transform of all elements on a slide. Returns actual rendered bounds.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        presentationId: { type: "string", description: "Presentation ID" },
+        slideObjectId: { type: "string", description: "Slide object ID (omit to get all slides)" }
+      },
+      required: ["presentationId"]
+    }
+  },
+  {
+    name: "moveSlideElement",
+    description: "Move and/or resize an element (image, text box, shape) on a Google Slides slide",
+    inputSchema: {
+      type: "object",
+      properties: {
+        presentationId: { type: "string", description: "Presentation ID" },
+        objectId: { type: "string", description: "Element object ID to move/resize" },
+        x: { type: "number", description: "New X position in EMU" },
+        y: { type: "number", description: "New Y position in EMU" },
+        width: { type: "number", description: "New width in EMU" },
+        height: { type: "number", description: "New height in EMU" }
+      },
+      required: ["presentationId", "objectId"]
+    }
+  },
+  {
+    name: "deleteSlideElement",
+    description: "Delete an element (image, text box, shape) from a Google Slides slide",
+    inputSchema: {
+      type: "object",
+      properties: {
+        presentationId: { type: "string", description: "Presentation ID" },
+        objectId: { type: "string", description: "Element object ID to delete" }
+      },
+      required: ["presentationId", "objectId"]
     }
   },
   {
@@ -1646,6 +1705,135 @@ export async function handleTool(
 
       return {
         content: [{ type: 'text', text: `Slide thumbnail URL (${a.mimeType}, ${a.size}): ${url}` }],
+        isError: false,
+      };
+    }
+
+    case "getSlideElementInfo": {
+      const validation = GetSlideElementInfoSchema.safeParse(args);
+      if (!validation.success) return errorResponse(validation.error.errors[0].message);
+      const a = validation.data;
+
+      const slidesService = ctx.google.slides({ version: 'v1', auth: ctx.authClient });
+      const pres = await slidesService.presentations.get({ presentationId: a.presentationId });
+      const slideWidth = pres.data.pageSize?.width?.magnitude || 9144000;
+      const slideHeight = pres.data.pageSize?.height?.magnitude || 6858000;
+
+      const lines: string[] = [`Slide dimensions: ${slideWidth} x ${slideHeight} EMU`];
+
+      for (const slide of pres.data.slides || []) {
+        if (a.slideObjectId && slide.objectId !== a.slideObjectId) continue;
+        lines.push(`\n--- Slide: ${slide.objectId} ---`);
+        for (const el of slide.pageElements || []) {
+          const t = el.transform || {};
+          const s = el.size || {};
+          const intrW = s.width?.magnitude || 0;
+          const intrH = s.height?.magnitude || 0;
+          const scX = t.scaleX || 1;
+          const scY = t.scaleY || 1;
+          const tx = t.translateX || 0;
+          const ty = t.translateY || 0;
+          const renderedW = intrW * scX;
+          const renderedH = intrH * scY;
+          const right = tx + renderedW;
+          const bottom = ty + renderedH;
+          const offPage = (right > slideWidth || bottom > slideHeight) ? ' *** OFF PAGE ***' : '';
+          lines.push(`  ${el.objectId} (${el.shape ? 'shape:' + el.shape.shapeType : el.image ? 'image' : 'other'})`);
+          lines.push(`    intrinsic: ${intrW} x ${intrH}, scale: ${scX} x ${scY}`);
+          lines.push(`    rendered: ${Math.round(renderedW)} x ${Math.round(renderedH)} at (${tx}, ${ty})`);
+          lines.push(`    bounds: right=${Math.round(right)}, bottom=${Math.round(bottom)}${offPage}`);
+        }
+      }
+
+      return { content: [{ type: 'text', text: lines.join('\n') }], isError: false };
+    }
+
+    case "moveSlideElement": {
+      const validation = MoveSlideElementSchema.safeParse(args);
+      if (!validation.success) return errorResponse(validation.error.errors[0].message);
+      const a = validation.data;
+
+      const slidesService = ctx.google.slides({ version: 'v1', auth: ctx.authClient });
+
+      // First get the current element to read its existing transform and size
+      const pres = await slidesService.presentations.get({ presentationId: a.presentationId });
+      let currentTransform: any = null;
+      let currentSize: any = null;
+      for (const slide of pres.data.slides || []) {
+        for (const el of slide.pageElements || []) {
+          if (el.objectId === a.objectId) {
+            currentTransform = el.transform;
+            currentSize = el.size;
+            break;
+          }
+        }
+        if (currentTransform) break;
+      }
+
+      if (!currentTransform) {
+        return errorResponse(`Element ${a.objectId} not found in presentation`);
+      }
+
+      // Compute new scale factors if width/height provided
+      const origWidth = (currentSize?.width?.magnitude || 3000000);
+      const origHeight = (currentSize?.height?.magnitude || 3000000);
+      const curScaleX = currentTransform.scaleX || 1;
+      const curScaleY = currentTransform.scaleY || 1;
+
+      let newScaleX = curScaleX;
+      let newScaleY = curScaleY;
+      if (a.width !== undefined) {
+        newScaleX = a.width / origWidth;
+      }
+      if (a.height !== undefined) {
+        newScaleY = a.height / origHeight;
+      }
+
+      const newX = a.x ?? (currentTransform.translateX || 0);
+      const newY = a.y ?? (currentTransform.translateY || 0);
+
+      const requests: any[] = [{
+        updatePageElementTransform: {
+          objectId: a.objectId,
+          applyMode: 'ABSOLUTE',
+          transform: {
+            scaleX: newScaleX,
+            scaleY: newScaleY,
+            translateX: newX,
+            translateY: newY,
+            shearX: currentTransform.shearX || 0,
+            shearY: currentTransform.shearY || 0,
+            unit: 'EMU',
+          },
+        },
+      }];
+
+      await slidesService.presentations.batchUpdate({
+        presentationId: a.presentationId,
+        requestBody: { requests },
+      });
+
+      return {
+        content: [{ type: 'text', text: `Moved element ${a.objectId} to (${newX}, ${newY})` }],
+        isError: false,
+      };
+    }
+
+    case "deleteSlideElement": {
+      const validation = DeleteSlideElementSchema.safeParse(args);
+      if (!validation.success) return errorResponse(validation.error.errors[0].message);
+      const a = validation.data;
+
+      const slidesService = ctx.google.slides({ version: 'v1', auth: ctx.authClient });
+      await slidesService.presentations.batchUpdate({
+        presentationId: a.presentationId,
+        requestBody: {
+          requests: [{ deleteObject: { objectId: a.objectId } }],
+        },
+      });
+
+      return {
+        content: [{ type: 'text', text: `Deleted element ${a.objectId}` }],
         isError: false,
       };
     }
