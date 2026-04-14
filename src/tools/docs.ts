@@ -1,10 +1,9 @@
 import { z } from 'zod';
-import { createReadStream, existsSync } from 'fs';
-import { basename, extname } from 'path';
 import JSZip from 'jszip';
 import type { ToolDefinition, ToolContext, ToolResult } from '../types.js';
 import { errorResponse } from '../types.js';
 import { escapeDriveQuery } from '../utils.js';
+import { uploadImageToDrive } from '../utils/driveImageUpload.js';
 
 // ---------------------------------------------------------------------------
 // Helper functions
@@ -363,87 +362,7 @@ async function insertInlineImageHelper(
   return executeBatchUpdate(ctx, documentId, [request]);
 }
 
-// Upload a local image to Drive and return its URL
-async function uploadImageToDriveHelper(
-  ctx: ToolContext,
-  localFilePath: string,
-  parentFolderId?: string,
-  makePublic: boolean = false
-): Promise<string> {
-  // Verify file exists
-  if (!existsSync(localFilePath)) {
-    throw new Error(`Image file not found: ${localFilePath}`);
-  }
-
-  // Get file name and mime type
-  const fileName = basename(localFilePath);
-  const mimeTypeMap: { [key: string]: string } = {
-    '.jpg': 'image/jpeg',
-    '.jpeg': 'image/jpeg',
-    '.png': 'image/png',
-    '.gif': 'image/gif',
-    '.bmp': 'image/bmp',
-    '.webp': 'image/webp',
-    '.svg': 'image/svg+xml'
-  };
-
-  const ext = extname(localFilePath).toLowerCase();
-  const mimeType = mimeTypeMap[ext] || 'application/octet-stream';
-
-  // Upload file to Drive
-  const fileMetadata: any = {
-    name: fileName,
-    mimeType: mimeType
-  };
-
-  if (parentFolderId) {
-    fileMetadata.parents = [parentFolderId];
-  }
-
-  const media = {
-    mimeType: mimeType,
-    body: createReadStream(localFilePath)
-  };
-
-  const drive = ctx.getDrive();
-
-  const uploadResponse = await drive.files.create({
-    requestBody: fileMetadata,
-    media: media,
-    fields: 'id,webViewLink,webContentLink',
-    supportsAllDrives: true
-  });
-
-  const fileId = uploadResponse.data.id;
-  if (!fileId) {
-    throw new Error('Failed to upload image to Drive - no file ID returned');
-  }
-
-  if (makePublic) {
-    // Make the file publicly readable so the Docs API can fetch it
-    await drive.permissions.create({
-      fileId: fileId,
-      requestBody: {
-        role: 'reader',
-        type: 'anyone'
-      }
-    });
-  }
-
-  // Get the webContentLink
-  const fileInfo = await drive.files.get({
-    fileId: fileId,
-    fields: 'webContentLink',
-    supportsAllDrives: true
-  });
-
-  const webContentLink = fileInfo.data.webContentLink;
-  if (!webContentLink) {
-    throw new Error('Failed to get web content link for uploaded image');
-  }
-
-  return webContentLink;
-}
+// Image upload moved to ../utils/driveImageUpload.ts.
 
 // ---------------------------------------------------------------------------
 // Comment context extraction helpers
@@ -2901,7 +2820,10 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
       }
 
       // Upload the image to Drive
-      const imageUrl = await uploadImageToDriveHelper(ctx, a.localImagePath, parentFolderId, a.makePublic);
+      const { webContentLink: imageUrl } = await uploadImageToDrive(ctx, a.localImagePath, {
+        parentFolderId,
+        makePublic: a.makePublic,
+      });
 
       // Insert the image into the document
       await insertInlineImageHelper(ctx, a.documentId, imageUrl, a.index, a.width, a.height);
